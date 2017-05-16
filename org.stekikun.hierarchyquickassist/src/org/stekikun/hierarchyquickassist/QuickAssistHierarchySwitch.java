@@ -18,6 +18,7 @@ import org.eclipse.jdt.core.dom.EnumDeclaration;
 import org.eclipse.jdt.core.dom.Expression;
 import org.eclipse.jdt.core.dom.FieldAccess;
 import org.eclipse.jdt.core.dom.IAnnotationBinding;
+import org.eclipse.jdt.core.dom.IBinding;
 import org.eclipse.jdt.core.dom.IExtendedModifier;
 import org.eclipse.jdt.core.dom.IMemberValuePairBinding;
 import org.eclipse.jdt.core.dom.IMethodBinding;
@@ -104,6 +105,8 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 			}
 		};
 		
+//		return new IJavaCompletionProposal[] { astSpy };
+		
 		// If applicable, the actual proposal that will generate the
 		// hierarchy switch
 		IJavaCompletionProposal[] hierSwitch = getHierarchySwitchProposals(context);
@@ -114,9 +117,12 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 			return hierSwitch;
 	}
 	
-	private static boolean logging = true;
+	private static boolean logging = false;
 	private static void log(String s) {
 		if (logging) System.out.println(s);
+	}
+	private static void err(String s) {
+		System.err.println(s);
 	}
 	
 	private static /* NULLABLE */ 
@@ -127,30 +133,63 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		
 		// Is it a switch statement?
 		if (coveringNode.getNodeType() != ASTNode.SWITCH_STATEMENT) {
-			// Or maybe is it the expression in a switch statement? 
-			ASTNode parent = coveringNode.getParent();
-			if (parent == null) return null;
-			if (parent.getNodeType() != ASTNode.SWITCH_STATEMENT)
-				return null;
-			if (((SwitchStatement) parent).getExpression() != coveringNode)
+			// Or maybe is it the expression in a switch statement?
+			// (or a sub-expression thereof)
+			ASTNode heir = coveringNode;
+			ASTNode parent;
+			while (true) {
+				parent = heir.getParent();
+				if (parent == null) return null;
+				if (parent.getNodeType() == ASTNode.SWITCH_STATEMENT) break;
+				heir = parent;
+			}
+			// Check that we weren't in the body part of a switch, in which
+			// case it's too dangerous to propose to replace the whole switch
+			// (Imagine a cascade of generated switches, and applying one of
+			// the sub-switches incorrectly will apply to the outer switch...)
+			if (((SwitchStatement) parent).getExpression() != heir)
 				return null;
 			coveringNode = (SwitchStatement) parent;
 		}
 		SwitchStatement ss = (SwitchStatement) coveringNode;
-		// Is the switch on an expression whose type is a base hierarchy class?
 		if (ss.getExpression() == null) return null;
 		Expression sw = ss.getExpression();
+		// Now that we have a switch expression, we are interested in either
+		// an expression whose type is an enum, obtained by a method annotated
+		// as @Hierarchy, or a base hierarchy class, in which case we'll have
+		// to add the method invocation / field access to retrieve the enum.
 		ITypeBinding ty = sw.resolveTypeBinding();
 		if (ty == null) return null;
 		log("Type of switch expression is " + ty.getName());
+		final IBinding binding;
+		final Expression receiver;
+		if (ty.isEnum()) {
+			// If the type is an enum, it can't be the base of a class
+			// hierarchy, so it has to be the result of an external kind method
+			if (!(sw instanceof MethodInvocation)) return null;
+			MethodInvocation m = (MethodInvocation) sw;
+			IMethodBinding method = m.resolveMethodBinding();
+			if (method == null) return null;
+			if (m.arguments() == null || m.arguments().size() != 1) return null;
+			Expression arg = (Expression) m.arguments().get(0);
+			if (arg == null) return null;
+			binding = method;
+			receiver = arg;
+		}
+		else {
+			// If the type is not an enum, we must be switching on
+			// an instance of a base hierarchy class
+			binding = ty;
+			receiver = sw;
+		}
 		
-		// Find the Hierarchy annotation on the class declaration
+		// Find the Hierarchy annotation on the class/method declaration
 		// (note: we stop at the first one we find, it doesn't
 		//  make sense to add more than one anyway)
-		IAnnotationBinding[] annots = ty.getAnnotations();
+		IAnnotationBinding[] annots = binding.getAnnotations();
 		IAnnotationBinding hannot = null;
 		if (annots.length != 0) {
-			log("Annotations on type: ");
+			log("Annotations on binding: ");
 			for (IAnnotationBinding annot : annots) {
 				log(annot.toString());
 				if (annot.getName().equals("Hierarchy")) {
@@ -161,12 +200,13 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		if (hannot == null) return null;
 		
 		// Interpret the configuration in the annotation
-		final HierarchyConfig config = HierarchyConfig.of(ss.getAST(), ty, hannot);
+		final HierarchyConfig config =
+			HierarchyConfig.of(ss.getAST(), binding, hannot, receiver);
 		if (config == null) return null;
 		
 		EnumDeclaration enumDecl = getEnumDeclaration(context, config.enumType);
 		if (enumDecl == null) {
-			log("Could not find enum declaration for hierarchy kind");
+			err("Could not find enum declaration for hierarchy kind");
 			return null;
 		}
 		@SuppressWarnings("unchecked")
@@ -183,12 +223,12 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		};
 		ASTRewriteCorrectionProposal rewReturn =
 			getHierarchySwitchRewrite(
-					"Generate hierarchy switch (return)", 11,
+					"Generate hierarchy switch (return)", 12,
 					context, ss, config, kindDecls,
 					returnStatement, true);
 		ASTRewriteCorrectionProposal rewBreak =
 			getHierarchySwitchRewrite(
-					"Generate hierarchy switch (break)", 10,
+					"Generate hierarchy switch (break)", 11,
 					context, ss, config, kindDecls,
 					(AST ast) -> ast.newBreakStatement(), false);
 		
@@ -239,13 +279,13 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 			String cid = variableNameOf(ctype);
 			Type typeref = swCtxt.addImport(ctypeBinding);
 			
-			// A a = (A) sw
+			// final A a = (A) receiver
 			VariableDeclarationFragment vdeclf = ast.newVariableDeclarationFragment();
 			vdeclf.setName(ast.newSimpleName(cid));
 			CastExpression ce = ast.newCastExpression();
 			
 			// NB: do not copy from newsw, it is lazily copied when rew is applied...
-			ce.setExpression((Expression) ASTNode.copySubtree(ast, sw));
+			ce.setExpression((Expression) ASTNode.copySubtree(ast, config.receiver));
 			ce.setType(typeref);
 			vdeclf.setInitializer(ce);
 			
@@ -295,20 +335,28 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 	}
 	
 	private static Expression makeInstanceKind(
-		Expression receiver, HierarchyConfig config, ASTRewrite rew) {
-		Expression newReceiver = (Expression) rew.createCopyTarget(receiver);
+			Expression sw, HierarchyConfig config, ASTRewrite rew) {
 		final AST ast = rew.getAST();
-		if (config.method) {
+		switch (config.dispatcherKind) {
+		case METHOD: {
+			Expression newReceiver = (Expression) rew.createCopyTarget(config.receiver);
 			MethodInvocation mi = ast.newMethodInvocation();
 			mi.setName(ast.newSimpleName(config.name));
 			mi.setExpression(newReceiver);
 			return mi;
-		} else {
+		}
+		case FIELD: {
+			Expression newReceiver = (Expression) rew.createCopyTarget(config.receiver);
 			FieldAccess fa = ast.newFieldAccess();
 			fa.setName(ast.newSimpleName(config.name));
 			fa.setExpression(newReceiver);
 			return fa;
 		}
+		case EXTERNAL:
+			Expression newSw = (Expression) rew.createCopyTarget(sw);
+			return newSw;
+		}
+		throw new IllegalStateException("Unknown dispatcher kind: " + config.dispatcherKind);
 	}
 	
 	private static EnumDeclaration 
@@ -322,7 +370,6 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		// If the type is local, we already have an AST, no need to parse
 		ICompilationUnit cuKind = enumTypeModel.getCompilationUnit();
 		if (cuKind.equals(context.getCompilationUnit())) {
-			System.out.println("Local!");
 			ASTNode decl = context.getASTRoot().findDeclaringNode(enumTypeBinding);
 			if (!(decl instanceof EnumDeclaration))
 				/* catches null, mostly */ return null;
@@ -341,29 +388,36 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		return ((EnumDeclaration) decl);
 	}
 		
+	private static enum DispatcherKind {
+		METHOD, FIELD, EXTERNAL;
+	}
+	
 	private static final class HierarchyConfig {
 		final String name;
-		final boolean method;
+		final DispatcherKind dispatcherKind;
 		final /* NULLABLE */ ITypeBinding unmatched;
+		final Expression receiver;
 		
 		final ITypeBinding enumType;
 		@SuppressWarnings("unused")
 		final IMethodBinding unmatchedCtor;
 		
 		private HierarchyConfig(
-			String name, boolean method, /* NULLABLE */ ITypeBinding unmatched,
-			ITypeBinding enumType, IMethodBinding unmatchedCtor) {
+			String name, DispatcherKind dispatcherKind, /* NULLABLE */ ITypeBinding unmatched,
+			Expression receiver, ITypeBinding enumType, IMethodBinding unmatchedCtor) {
 			this.name = name;
-			this.method = method;
+			this.dispatcherKind = dispatcherKind;
 			this.unmatched = unmatched;
+			this.receiver = receiver;
 			this.enumType = enumType;
 			this.unmatchedCtor = unmatchedCtor;
 		}
 		
-		static HierarchyConfig of(AST ast, ITypeBinding ty, IAnnotationBinding annot) {
-			String methodName = null;	// has to be filled below
-			boolean method = true;		// if missing, method
-			ITypeBinding unmatched = null;	// if missing, null
+		static HierarchyConfig of(AST ast, IBinding binding,
+				IAnnotationBinding annot, Expression receiver) {
+			String methodName = null;									// has to be filled below
+			DispatcherKind dispatcherKind = DispatcherKind.METHOD;		// if missing, method
+			ITypeBinding unmatched = null;								// if missing, null
 			
 			// Iterate on member-value pairs, including defaults
 			for (IMemberValuePairBinding e : annot.getAllMemberValuePairs()) {
@@ -371,67 +425,85 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 				Object o = e.getValue();
 				if (name.equals("value")) {
 					if (!(o instanceof String)) {
-						log("In Hierarchy annotation, 'value' member is not a String");
+						err("In Hierarchy annotation, 'value' member is not a String");
 						// Terminal error
 						return null;
 					}
 					methodName = (String) o;
 				} else if (name.equals("field")) {
 					if (!(o instanceof Boolean)) {
-						log("In Hierarchy annotation, ignored non-boolean 'field' member");
+						err("In Hierarchy annotation, ignored non-boolean 'field' member");
 						continue;
 					}
-					method = !((Boolean) o);
+					dispatcherKind = ((Boolean) o) ? DispatcherKind.FIELD : DispatcherKind.METHOD;
 				} else if (e.getName().equals("unmatched")) {
 					if (!(o instanceof ITypeBinding)) {
-						log("In Hierarchy annotation, 'unmatched' member is not a class");
+						err("In Hierarchy annotation, 'unmatched' member is not a class");
 						continue;
 					}
 					unmatched = (ITypeBinding) o;
 				}
 			}
 			if (methodName == null) {
-				log("In Hierarchy annotation, no 'value' member was found");
+				err("In Hierarchy annotation, no 'value' member was found");
 				return null;
 			}
 			
 			// Now find the return type of the method, or the type of the field
 			// with the specified name.
 			final ITypeBinding enumType;
-			if (method) {
-				IMethodBinding zeMethod = null;
-				for (IMethodBinding mb : ty.getDeclaredMethods()) {
-					if (mb.getName().equals(methodName)) {
-						zeMethod = mb;
-						break;
+			if (binding instanceof ITypeBinding) {
+				// If we are looking at the base of a class hierarchy,
+				// look for the specified method/field
+				ITypeBinding ty = (ITypeBinding) binding;
+				if (dispatcherKind == DispatcherKind.METHOD) {
+					IMethodBinding zeMethod = null;
+					for (IMethodBinding mb : ty.getDeclaredMethods()) {
+						if (mb.getName().equals(methodName)) {
+							zeMethod = mb;
+							break;
+						}
 					}
+					if (zeMethod == null) {
+						err("Could not find specified method " + methodName);
+						return null;
+					}
+					log("Method on which to switch: " + zeMethod);
+					enumType = zeMethod.getReturnType();
 				}
-				if (zeMethod == null) {
-					log("Could not find specified method " + methodName);
-					return null;
+				else {	// FIELD
+					IVariableBinding zeField = null;
+					for (IVariableBinding vb : ty.getDeclaredFields()) {
+						if (vb.getName().equals(methodName)) {
+							zeField = vb;
+							break;
+						}
+					}
+					if (zeField == null) {
+						err("Could not find specified field " + methodName);
+						return null;
+					}
+					log("Field on which to switch: " + zeField);
+					enumType = zeField.getType();
 				}
-				log("Method on which to switch: " + zeMethod);
-				enumType = zeMethod.getReturnType();
 			}
 			else {
-				IVariableBinding zeField = null;
-				for (IVariableBinding vb : ty.getDeclaredFields()) {
-					if (vb.getName().equals(methodName)) {
-						zeField = vb;
-						break;
-					}
-				}
-				if (zeField == null) {
-					log("Could not find specified field " + methodName);
-					return null;
-				}
-				log("Field on which to switch: " + zeField);
-				enumType = zeField.getType();
+				IMethodBinding meth = (IMethodBinding) binding;
+				// If we are looking at an external method, the method
+				// spec should be "", the field is ignored, and we simply
+				// look at the method's return type
+				if (!methodName.equals(""))
+					err("Annotation value should be \"\" when using external dispatcher " + meth);
+				
+				log("Switch using external dispatcher: " + meth);
+				enumType = meth.getReturnType();
+				dispatcherKind = DispatcherKind.EXTERNAL;
 			}
 			
 			// That type must be an enum
-			if (!enumType.isEnum()) {
-				log("Type of specified " + (method ? "method " : "field ")
+			if (enumType == null || !enumType.isEnum()) {
+				err("Type of specified " 
+					+ (dispatcherKind == DispatcherKind.FIELD ? "field " : "method ")
 					+ methodName + " is not an Enum type");
 				return null;
 			}
@@ -442,7 +514,7 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 				// First it must be a subtype of java.lang.Exception
 				ITypeBinding exn = ast.resolveWellKnownType("java.lang.RuntimeException");
 				if (!unmatched.isSubTypeCompatible(exn)) {
-					log("Specified unmatched class " + unmatched.getQualifiedName()
+					err("Specified unmatched class " + unmatched.getQualifiedName()
 						+ " is not a subtype of java.lang.RuntimeException");
 					return null;
 				}
@@ -465,13 +537,14 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 					break;
 				}
 				if (ctor == null) {
-					log("Specified unmatched class " + unmatched.getQualifiedName()
+					err("Specified unmatched class " + unmatched.getQualifiedName()
 						+ " has no suitable constructor");
 					return null;
 				}
 			}
 			
-			return new HierarchyConfig(methodName, method, unmatched, enumType, ctor);
+			return new HierarchyConfig(methodName, dispatcherKind, unmatched,
+					receiver, enumType, ctor);
 		}
 	}
 	
