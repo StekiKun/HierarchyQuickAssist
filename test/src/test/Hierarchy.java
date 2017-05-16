@@ -86,7 +86,7 @@ import java.lang.annotation.Target;
  * @author slescuyer
  */
 @Retention(RetentionPolicy.CLASS)
-@Target(ElementType.TYPE)
+@Target({ElementType.TYPE, ElementType.METHOD})
 public @interface Hierarchy {
 
 	/**
