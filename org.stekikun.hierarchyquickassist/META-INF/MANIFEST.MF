@@ -1,6 +1,6 @@
 Manifest-Version: 1.0
 Bundle-ManifestVersion: 2
-Bundle-Name: Quickassist
+Bundle-Name: Hierarchy Quickassist
 Bundle-SymbolicName: org.stekikun.hierarchyquickassist;singleton:=true
 Bundle-Version: 1.0.0.qualifier
 Bundle-Activator: org.stekikun.hierarchyquickassist.Activator
