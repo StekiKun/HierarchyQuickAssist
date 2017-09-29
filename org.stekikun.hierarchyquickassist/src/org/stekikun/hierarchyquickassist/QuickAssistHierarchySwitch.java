@@ -556,11 +556,11 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		}
 		else if (type instanceof QualifiedType) {
 			QualifiedType qt = (QualifiedType) type;
-			return qt.getName().getIdentifier().toLowerCase();
+			return variableNameOf(qt.getName().getIdentifier());
 		}
 		else if (type instanceof NameQualifiedType) {
 			NameQualifiedType nqt = (NameQualifiedType) type;
-			return nqt.getName().getIdentifier().toLowerCase();
+			return variableNameOf(nqt.getName().getIdentifier());
 		}
 		else 
 			return "default";
@@ -574,7 +574,14 @@ public class QuickAssistHierarchySwitch implements IQuickAssistProcessor {
 		}
 		else
 			sn = (SimpleName) n;
-		return sn.getIdentifier().toLowerCase();
+		return variableNameOf(sn.getIdentifier());
+	}
+	
+	private static String variableNameOf(String type) {
+		// Assuming the type's simple name will be in CamlCase
+		// a good candidate for the corresponding local variable
+		// is the same name in camlCase
+		return "" + Character.toLowerCase(type.charAt(0)) + type.substring(1);
 	}
 	
 	private static boolean inVoidFunction(ASTNode node) {
